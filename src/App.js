@@ -1,11 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { ethers } from 'ethers';
 import { ToastContainer, toast } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 import 'bootstrap/dist/css/bootstrap.min.css';
 
-// Components
 import Navbar from './components/Navbar';
 import Dashboard from './components/Dashboard';
 import ArbitrageOpportunities from './components/ArbitrageOpportunities';
@@ -13,14 +12,27 @@ import Staking from './components/Staking';
 import Portfolio from './components/Portfolio';
 import Admin from './components/Admin';
 
-        // Contracts
-        import ARBXTokenABI from './contracts/ARBXToken.json';
-        import ArbitrageXExchangeABI from './contracts/ArbitrageXExchange.json';
-        import HybridDEXABI from './contracts/HybridDEX.json';
-        import ArbitrageBotABI from './contracts/ArbitrageBot.json';
-
-// Context
+import ARBXTokenABI from './contracts/ARBXToken.json';
+import ArbitrageXExchangeABI from './contracts/ArbitrageXExchange.json';
+import HybridDEXABI from './contracts/HybridDEX.json';
+import ArbitrageBotABI from './contracts/ArbitrageBot.json';
 import { Web3Provider } from './context/Web3Context';
+
+const REQUIRED_CHAIN_ID = 137n;
+const DEPLOYMENT_URL = '/deployment.json';
+const CONTRACTS = [
+  ['arbxToken', ARBXTokenABI],
+  ['exchange', ArbitrageXExchangeABI],
+  ['hybridDEX', HybridDEXABI],
+  ['bot', ArbitrageBotABI]
+];
+
+function normalizeAddress(value, name) {
+  if (!value || !ethers.isAddress(value) || value === ethers.ZeroAddress) {
+    throw new Error(`Missing or invalid ${name} deployment address`);
+  }
+  return ethers.getAddress(value);
+}
 
 function App() {
   const [account, setAccount] = useState(null);
@@ -28,146 +40,147 @@ function App() {
   const [contracts, setContracts] = useState({});
   const [isConnected, setIsConnected] = useState(false);
   const [loading, setLoading] = useState(false);
-
-  // Contract addresses (will be loaded from deployment.json)
-          const [contractAddresses, setContractAddresses] = useState({
-            arbxToken: '',
-            exchange: '',
-            hybridDEX: '',
-            bot: ''
-        });
+  const [deploymentReady, setDeploymentReady] = useState(false);
+  const [contractAddresses, setContractAddresses] = useState(null);
+  const addressesRef = useRef(null);
+  const initializeWalletRef = useRef(null);
 
   useEffect(() => {
-    loadDeploymentInfo();
-    checkWalletConnection();
+    let active = true;
+
+    fetch(DEPLOYMENT_URL, { headers: { Accept: 'application/json' } })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Deployment config request failed (${response.status})`);
+        return response.json();
+      })
+      .then((deployment) => {
+        const source = deployment?.contracts;
+        if (!source) throw new Error('Deployment config has no contracts object');
+
+        const addresses = Object.fromEntries(
+          CONTRACTS.map(([key]) => [key, normalizeAddress(source[key], key)])
+        );
+
+        if (active) {
+          addressesRef.current = addresses;
+          setContractAddresses(addresses);
+          setDeploymentReady(true);
+        }
+      })
+      .catch((error) => {
+        console.error('Unable to load deployment config:', error);
+        if (active) {
+          setDeploymentReady(true);
+          toast.error('Contract deployment configuration is unavailable. Wallet actions are disabled.');
+        }
+      });
+
+    return () => { active = false; };
   }, []);
 
-  const loadDeploymentInfo = async () => {
-    try {
-      const response = await fetch('/deployment.json');
-      const deploymentInfo = await response.json();
-              setContractAddresses({
-            arbxToken: deploymentInfo.contracts.arbxToken,
-            exchange: deploymentInfo.contracts.exchange,
-            hybridDEX: deploymentInfo.contracts.hybridDEX,
-            bot: deploymentInfo.contracts.bot
-        });
-    } catch (error) {
-      console.error('Error loading deployment info:', error);
-    }
-  };
-
-  const checkWalletConnection = async () => {
-    if (typeof window.ethereum !== 'undefined') {
-      try {
-        const accounts = await window.ethereum.request({ method: 'eth_accounts' });
-        if (accounts.length > 0) {
-          await connectWallet();
-        }
-      } catch (error) {
-        console.error('Error checking wallet connection:', error);
-      }
-    }
-  };
-
-  const connectWallet = async () => {
-    if (typeof window.ethereum !== 'undefined') {
-      try {
-        setLoading(true);
-        
-        // Request account access
-        const accounts = await window.ethereum.request({
-          method: 'eth_requestAccounts'
-        });
-
-        const account = accounts[0];
-        setAccount(account);
-
-        // Create provider and signer
-        const provider = new ethers.providers.Web3Provider(window.ethereum);
-        const signer = provider.getSigner();
-
-        // Check if we're on Polygon
-        const network = await provider.getNetwork();
-        if (network.chainId !== 137) {
-          toast.error('Please connect to Polygon network');
-          return;
-        }
-
-        setProvider(provider);
-        setIsConnected(true);
-
-        // Initialize contracts
-        const arbxToken = new ethers.Contract(
-          contractAddresses.arbxToken,
-          ARBXTokenABI.abi,
-          signer
-        );
-
-                const exchange = new ethers.Contract(
-            contractAddresses.exchange,
-            ArbitrageXExchangeABI.abi,
-            signer
-        );
-
-        const hybridDEX = new ethers.Contract(
-            contractAddresses.hybridDEX,
-            HybridDEXABI.abi,
-            signer
-        );
-
-        const bot = new ethers.Contract(
-            contractAddresses.bot,
-            ArbitrageBotABI.abi,
-            signer
-        );
-
-        setContracts({
-            arbxToken,
-            exchange,
-            hybridDEX,
-            bot
-        });
-
-        toast.success('Wallet connected successfully!');
-
-        // Listen for account changes
-        window.ethereum.on('accountsChanged', (accounts) => {
-          if (accounts.length > 0) {
-            setAccount(accounts[0]);
-          } else {
-            disconnectWallet();
-          }
-        });
-
-        // Listen for chain changes
-        window.ethereum.on('chainChanged', (chainId) => {
-          if (chainId !== '0x89') { // Polygon chainId
-            toast.error('Please switch to Polygon network');
-            disconnectWallet();
-          }
-        });
-
-      } catch (error) {
-        console.error('Error connecting wallet:', error);
-        toast.error('Failed to connect wallet');
-      } finally {
-        setLoading(false);
-      }
-    } else {
-      toast.error('Please install MetaMask');
-    }
-  };
-
-  const disconnectWallet = () => {
+  const disconnectWallet = useCallback((notify = true) => {
     setAccount(null);
     setProvider(null);
     setContracts({});
     setIsConnected(false);
-    toast.info('Wallet disconnected');
-  };
+    if (notify) toast.info('Wallet disconnected');
+  }, []);
 
-  const web3ContextValue = {
+  const initializeWallet = useCallback(async (requestedAccounts) => {
+    if (!window.ethereum) throw new Error('Please install a supported wallet');
+    if (!addressesRef.current) throw new Error('Contract deployment configuration is not ready');
+
+    const web3Provider = new ethers.BrowserProvider(window.ethereum, 'any');
+    const network = await web3Provider.getNetwork();
+    if (network.chainId !== REQUIRED_CHAIN_ID) {
+      disconnectWallet(false);
+      throw new Error('Switch your wallet to Polygon (chain ID 137)');
+    }
+
+    const accounts = requestedAccounts || await window.ethereum.request({ method: 'eth_accounts' });
+    if (!accounts?.length) {
+      disconnectWallet(false);
+      return;
+    }
+
+    const signer = await web3Provider.getSigner(accounts[0]);
+    const signerAddress = ethers.getAddress(await signer.getAddress());
+    const instances = Object.fromEntries(
+      CONTRACTS.map(([key, artifact]) => [
+        key,
+        new ethers.Contract(addressesRef.current[key], artifact.abi, signer)
+      ])
+    );
+
+    setProvider(web3Provider);
+    setAccount(signerAddress);
+    setContracts(instances);
+    setIsConnected(true);
+  }, [disconnectWallet]);
+
+  initializeWalletRef.current = initializeWallet;
+
+  useEffect(() => {
+    if (!window.ethereum) return undefined;
+
+    const onAccountsChanged = (accounts) => {
+      if (!accounts?.length) {
+        disconnectWallet(false);
+        return;
+      }
+      initializeWalletRef.current?.(accounts).catch((error) => {
+        console.error('Wallet account update failed:', error);
+        toast.error(error.message || 'Unable to update wallet account');
+      });
+    };
+
+    const onChainChanged = () => {
+      initializeWalletRef.current?.().catch((error) => {
+        console.error('Wallet network update failed:', error);
+        toast.error(error.message || 'Unable to update wallet network');
+      });
+    };
+
+    window.ethereum.on('accountsChanged', onAccountsChanged);
+    window.ethereum.on('chainChanged', onChainChanged);
+
+    return () => {
+      window.ethereum.removeListener?.('accountsChanged', onAccountsChanged);
+      window.ethereum.removeListener?.('chainChanged', onChainChanged);
+    };
+  }, [disconnectWallet]);
+
+  useEffect(() => {
+    if (!deploymentReady || !addressesRef.current || !window.ethereum) return;
+    window.ethereum.request({ method: 'eth_accounts' })
+      .then((accounts) => accounts.length && initializeWalletRef.current?.(accounts))
+      .catch((error) => console.error('Wallet auto-connect check failed:', error));
+  }, [deploymentReady]);
+
+  const connectWallet = useCallback(async () => {
+    if (!window.ethereum) {
+      toast.error('Please install a supported wallet');
+      return;
+    }
+    if (!addressesRef.current) {
+      toast.error('Contract configuration is not ready');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+      await initializeWallet(accounts);
+      toast.success('Wallet connected to Polygon');
+    } catch (error) {
+      console.error('Wallet connection failed:', error);
+      toast.error(error.message || 'Failed to connect wallet');
+    } finally {
+      setLoading(false);
+    }
+  }, [initializeWallet]);
+
+  const web3ContextValue = useMemo(() => ({
     account,
     provider,
     contracts,
@@ -176,14 +189,13 @@ function App() {
     connectWallet,
     disconnectWallet,
     contractAddresses
-  };
+  }), [account, provider, contracts, isConnected, loading, connectWallet, disconnectWallet, contractAddresses]);
 
   return (
     <Web3Provider value={web3ContextValue}>
       <Router>
         <div className="App">
           <Navbar />
-          
           <main className="container-fluid">
             <Routes>
               <Route path="/" element={<Dashboard />} />
@@ -193,22 +205,11 @@ function App() {
               <Route path="/admin" element={<Admin />} />
             </Routes>
           </main>
-
-          <ToastContainer
-            position="top-right"
-            autoClose={5000}
-            hideProgressBar={false}
-            newestOnTop={false}
-            closeOnClick
-            rtl={false}
-            pauseOnFocusLoss
-            draggable
-            pauseOnHover
-          />
+          <ToastContainer position="top-right" autoClose={5000} closeOnClick pauseOnFocusLoss draggable pauseOnHover />
         </div>
       </Router>
     </Web3Provider>
   );
 }
 
-export default App; 
+export default App;
