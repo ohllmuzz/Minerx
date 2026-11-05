@@ -1,269 +1,196 @@
 import { ethers } from 'ethers';
-import axios from 'axios';
 
-class RealDataService {
-    constructor(provider, contracts) {
-        this.provider = provider;
-        this.contracts = contracts;
-        this.priceCache = new Map();
-        this.cacheTimeout = 30000; // 30 seconds
+const DEFAULT_BASE_TOKEN = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const ROUTERS = {
+  quickswap: '0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff',
+  sushiswap: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506'
+};
+const ROUTER_ABI = ['function getAmountsOut(uint256 amountIn,address[] path) view returns (uint256[] amounts)'];
+const ERC20_ABI = ['function balanceOf(address owner) view returns (uint256)', 'function decimals() view returns (uint8)'];
+const MAX_CONCURRENT_READS = 8;
+
+async function mapLimit(values, limit, mapper) {
+  const results = new Array(values.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, values.length) }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= values.length) return;
+      try { results[index] = await mapper(values[index], index); }
+      catch (error) { results[index] = { error }; }
     }
-
-    // Get real token price from blockchain
-    async getTokenPrice(tokenAddress, baseToken = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174') { // USDC
-        try {
-            const cacheKey = `${tokenAddress}-${baseToken}`;
-            const cached = this.priceCache.get(cacheKey);
-            
-            if (cached && Date.now() - cached.timestamp < this.cacheTimeout) {
-                return cached.price;
-            }
-
-            // Get price from QuickSwap
-            const quickswapPrice = await this.getQuickSwapPrice(tokenAddress, baseToken);
-            
-            // Get price from SushiSwap
-            const sushiswapPrice = await this.getSushiSwapPrice(tokenAddress, baseToken);
-            
-            // Use the better price (higher for selling, lower for buying)
-            const price = quickswapPrice > 0 && sushiswapPrice > 0 
-                ? Math.max(quickswapPrice, sushiswapPrice)
-                : Math.max(quickswapPrice, sushiswapPrice);
-
-            this.priceCache.set(cacheKey, {
-                price,
-                timestamp: Date.now()
-            });
-
-            return price;
-        } catch (error) {
-            console.error('Error getting token price:', error);
-            return 0;
-        }
-    }
-
-    // Get price from QuickSwap
-    async getQuickSwapPrice(tokenAddress, baseToken) {
-        try {
-            if (!this.contracts.hybridDEX) return 0;
-
-            const QUICKSWAP_ROUTER = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff";
-            const router = new ethers.Contract(
-                QUICKSWAP_ROUTER,
-                [
-                    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)'
-                ],
-                this.provider
-            );
-
-            const amountIn = ethers.utils.parseEther("1");
-            const path = [tokenAddress, baseToken];
-            
-            const amounts = await router.getAmountsOut(amountIn, path);
-            return parseFloat(ethers.utils.formatUnits(amounts[1], 6)); // USDC has 6 decimals
-        } catch (error) {
-            console.error('Error getting QuickSwap price:', error);
-            return 0;
-        }
-    }
-
-    // Get price from SushiSwap
-    async getSushiSwapPrice(tokenAddress, baseToken) {
-        try {
-            if (!this.contracts.hybridDEX) return 0;
-
-            const SUSHISWAP_ROUTER = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
-            const router = new ethers.Contract(
-                SUSHISWAP_ROUTER,
-                [
-                    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)'
-                ],
-                this.provider
-            );
-
-            const amountIn = ethers.utils.parseEther("1");
-            const path = [tokenAddress, baseToken];
-            
-            const amounts = await router.getAmountsOut(amountIn, path);
-            return parseFloat(ethers.utils.formatUnits(amounts[1], 6)); // USDC has 6 decimals
-        } catch (error) {
-            console.error('Error getting SushiSwap price:', error);
-            return 0;
-        }
-    }
-
-    // Get real arbitrage opportunities from blockchain
-    async getArbitrageOpportunities() {
-        try {
-            if (!this.contracts.hybridDEX) return [];
-
-            const opportunities = await this.contracts.hybridDEX.getActiveOpportunities();
-            const opportunitiesData = [];
-
-            for (const oppId of opportunities) {
-                const opp = await this.contracts.hybridDEX.getArbitrageOpportunity(oppId);
-                
-                if (opp.isActive && opp.expiryTime > Math.floor(Date.now() / 1000)) {
-                    opportunitiesData.push({
-                        id: oppId,
-                        tokenA: opp.tokenA,
-                        tokenB: opp.tokenB,
-                        priceA: parseFloat(ethers.utils.formatEther(opp.priceA)),
-                        priceB: parseFloat(ethers.utils.formatEther(opp.priceB)),
-                        profitPotential: opp.profitPotential.toString(),
-                        minAmount: parseFloat(ethers.utils.formatEther(opp.minAmount)),
-                        maxAmount: parseFloat(ethers.utils.formatEther(opp.maxAmount)),
-                        expiryTime: new Date(opp.expiryTime * 1000).toLocaleString(),
-                        source: opp.source
-                    });
-                }
-            }
-
-            return opportunitiesData;
-        } catch (error) {
-            console.error('Error getting arbitrage opportunities:', error);
-            return [];
-        }
-    }
-
-    // Get real liquidity pools from blockchain
-    async getLiquidityPools() {
-        try {
-            if (!this.contracts.hybridDEX) return [];
-
-            const pools = await this.contracts.hybridDEX.getActivePools();
-            const poolsData = [];
-
-            for (const poolId of pools) {
-                const pool = await this.contracts.hybridDEX.getLiquidityPool(poolId);
-                
-                if (pool.isActive) {
-                    poolsData.push({
-                        id: poolId,
-                        tokenA: pool.tokenA,
-                        tokenB: pool.tokenB,
-                        reserveA: parseFloat(ethers.utils.formatEther(pool.reserveA)),
-                        reserveB: parseFloat(ethers.utils.formatEther(pool.reserveB)),
-                        totalSupply: parseFloat(ethers.utils.formatEther(pool.totalSupply)),
-                        lastUpdateTime: new Date(pool.lastUpdateTime * 1000).toLocaleString()
-                    });
-                }
-            }
-
-            return poolsData;
-        } catch (error) {
-            console.error('Error getting liquidity pools:', error);
-            return [];
-        }
-    }
-
-    // Get real platform statistics from blockchain
-    async getPlatformStats() {
-        try {
-            if (!this.contracts.hybridDEX) return {};
-
-            const stats = await this.contracts.hybridDEX.getPlatformStats();
-            
-            return {
-                totalTrades: stats.totalTradesCount.toString(),
-                totalVolume: parseFloat(ethers.utils.formatEther(stats.totalVolumeAmount)),
-                totalLiquidity: parseFloat(ethers.utils.formatEther(stats.totalLiquidityAmount)),
-                totalFees: parseFloat(ethers.utils.formatEther(stats.totalFeesAmount))
-            };
-        } catch (error) {
-            console.error('Error getting platform stats:', error);
-            return {};
-        }
-    }
-
-    // Get real user positions from blockchain
-    async getUserPositions(userAddress) {
-        try {
-            if (!this.contracts.hybridDEX) return [];
-
-            const pools = await this.contracts.hybridDEX.getActivePools();
-            const positions = [];
-
-            for (const poolId of pools) {
-                const position = await this.contracts.hybridDEX.getUserPosition(userAddress, poolId);
-                
-                if (position.liquidity > 0) {
-                    const pool = await this.contracts.hybridDEX.getLiquidityPool(poolId);
-                    
-                    positions.push({
-                        poolId,
-                        tokenA: pool.tokenA,
-                        tokenB: pool.tokenB,
-                        liquidity: parseFloat(ethers.utils.formatEther(position.liquidity)),
-                        tokenAAmount: parseFloat(ethers.utils.formatEther(position.tokenAAmount)),
-                        tokenBAmount: parseFloat(ethers.utils.formatEther(position.tokenBAmount)),
-                        lastClaimTime: new Date(position.lastClaimTime * 1000).toLocaleString()
-                    });
-                }
-            }
-
-            return positions;
-        } catch (error) {
-            console.error('Error getting user positions:', error);
-            return [];
-        }
-    }
-
-    // Get real gas price from blockchain
-    async getGasPrice() {
-        try {
-            const gasPrice = await this.provider.getGasPrice();
-            return parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei'));
-        } catch (error) {
-            console.error('Error getting gas price:', error);
-            return 0;
-        }
-    }
-
-    // Get real token balances from blockchain
-    async getTokenBalances(userAddress, tokenAddresses) {
-        try {
-            const balances = {};
-            
-            for (const tokenAddress of tokenAddresses) {
-                const token = new ethers.Contract(
-                    tokenAddress,
-                    ['function balanceOf(address owner) view returns (uint256)'],
-                    this.provider
-                );
-                
-                const balance = await token.balanceOf(userAddress);
-                balances[tokenAddress] = parseFloat(ethers.utils.formatEther(balance));
-            }
-            
-            return balances;
-        } catch (error) {
-            console.error('Error getting token balances:', error);
-            return {};
-        }
-    }
-
-    // Get real market data from external APIs (as backup)
-    async getMarketData(symbol) {
-        try {
-            // Use CoinGecko API as backup for market data
-            const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${symbol}&vs_currencies=usd`);
-            return response.data[symbol]?.usd || 0;
-        } catch (error) {
-            console.error('Error getting market data:', error);
-            return 0;
-        }
-    }
-
-    // Clear price cache
-    clearCache() {
-        this.priceCache.clear();
-    }
-
-    // Update cache timeout
-    setCacheTimeout(timeout) {
-        this.cacheTimeout = timeout;
-    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
-export default RealDataService; 
+const asNumber = (bigint, decimals) => Number(ethers.formatUnits(bigint, decimals));
+
+class RealDataService {
+  constructor(provider, contracts = {}) {
+    this.provider = provider;
+    this.contracts = contracts;
+    this.priceCache = new Map();
+    this.inflightPrices = new Map();
+    this.cacheTimeout = 30_000;
+  }
+
+  async getTokenPrice(tokenAddress, baseToken = DEFAULT_BASE_TOKEN) {
+    const key = `${tokenAddress.toLowerCase()}-${baseToken.toLowerCase()}`;
+    const cached = this.priceCache.get(key);
+    if (cached && Date.now() - cached.timestamp < this.cacheTimeout) return cached.prices;
+    if (this.inflightPrices.has(key)) return this.inflightPrices.get(key);
+
+    const request = this.getRouterPrices(tokenAddress, baseToken).then((prices) => {
+      this.priceCache.set(key, { prices, timestamp: Date.now() });
+      this.inflightPrices.delete(key);
+      return prices;
+    }).catch((error) => {
+      this.inflightPrices.delete(key);
+      throw error;
+    });
+    this.inflightPrices.set(key, request);
+    return request;
+  }
+
+  async getRouterPrices(tokenAddress, baseToken) {
+    if (!this.provider) throw new Error('Provider is not configured');
+    const [token, quote] = [
+      new ethers.Contract(ethers.getAddress(tokenAddress), ERC20_ABI, this.provider),
+      new ethers.Contract(ethers.getAddress(baseToken), ERC20_ABI, this.provider)
+    ];
+    const [tokenDecimals, quoteDecimals] = await Promise.all([token.decimals(), quote.decimals()]);
+    const amountIn = 10n ** BigInt(tokenDecimals);
+    const path = [ethers.getAddress(tokenAddress), ethers.getAddress(baseToken)];
+
+    const entries = Object.entries(ROUTERS);
+    const results = await Promise.all(entries.map(async ([name, address]) => {
+      try {
+        const router = new ethers.Contract(address, ROUTER_ABI, this.provider);
+        const amounts = await router.getAmountsOut(amountIn, path);
+        return { venue: name, price: asNumber(amounts[1], quoteDecimals), ok: true };
+      } catch (error) {
+        return { venue: name, price: null, ok: false, error: error.shortMessage || error.message };
+      }
+    }));
+    return results;
+  }
+
+  async getTokenPriceBestEffort(tokenAddress, baseToken = DEFAULT_BASE_TOKEN) {
+    const prices = await this.getTokenPrice(tokenAddress, baseToken);
+    return prices.filter((entry) => entry.ok && Number.isFinite(entry.price)).reduce(
+      (best, entry) => best === null || entry.price > best ? entry.price : best,
+      null
+    );
+  }
+
+  async readMany(ids, read, limit = MAX_CONCURRENT_READS) {
+    return mapLimit(Array.from(ids), limit, read);
+  }
+
+  async getArbitrageOpportunities() {
+    const contract = this.contracts.hybridDEX;
+    if (!contract) return [];
+    const ids = await contract.getActiveOpportunities();
+    const results = await this.readMany(ids, async (id) => {
+      const opp = await contract.getArbitrageOpportunity(id);
+      if (!opp.isActive || Number(opp.expiryTime) <= Math.floor(Date.now() / 1000)) return null;
+      return {
+        id,
+        tokenA: opp.tokenA,
+        tokenB: opp.tokenB,
+        priceA: ethers.formatUnits(opp.priceA, 18),
+        priceB: ethers.formatUnits(opp.priceB, 18),
+        profitPotential: opp.profitPotential.toString(),
+        minAmount: ethers.formatUnits(opp.minAmount, 18),
+        maxAmount: ethers.formatUnits(opp.maxAmount, 18),
+        expiryTime: new Date(Number(opp.expiryTime) * 1000).toISOString(),
+        source: opp.source
+      };
+    });
+    return results.filter((item) => item && !item.error);
+  }
+
+  async getLiquidityPools() {
+    const contract = this.contracts.hybridDEX;
+    if (!contract) return [];
+    const ids = await contract.getActivePools();
+    const results = await this.readMany(ids, async (id) => {
+      const pool = await contract.getLiquidityPool(id);
+      if (!pool.isActive) return null;
+      return {
+        id,
+        tokenA: pool.tokenA,
+        tokenB: pool.tokenB,
+        reserveA: pool.reserveA.toString(),
+        reserveB: pool.reserveB.toString(),
+        totalSupply: pool.totalSupply.toString(),
+        lastUpdateTime: new Date(Number(pool.lastUpdateTime) * 1000).toISOString()
+      };
+    });
+    return results.filter((item) => item && !item.error);
+  }
+
+  async getPlatformStats() {
+    const contract = this.contracts.hybridDEX;
+    if (!contract) return {};
+    const stats = await contract.getPlatformStats();
+    return {
+      totalTrades: stats.totalTradesCount.toString(),
+      totalVolume: ethers.formatUnits(stats.totalVolumeAmount, 18),
+      totalLiquidity: ethers.formatUnits(stats.totalLiquidityAmount, 18),
+      totalFees: ethers.formatUnits(stats.totalFeesAmount, 18)
+    };
+  }
+
+  async getUserPositions(userAddress) {
+    const contract = this.contracts.hybridDEX;
+    if (!contract) return [];
+    const ids = await contract.getActivePools();
+    const results = await this.readMany(ids, async (poolId) => {
+      const [position, pool] = await Promise.all([
+        contract.getUserPosition(userAddress, poolId),
+        contract.getLiquidityPool(poolId)
+      ]);
+      if (position.liquidity === 0n) return null;
+      return {
+        poolId,
+        tokenA: pool.tokenA,
+        tokenB: pool.tokenB,
+        liquidity: position.liquidity.toString(),
+        tokenAAmount: position.tokenAAmount.toString(),
+        tokenBAmount: position.tokenBAmount.toString(),
+        lastClaimTime: new Date(Number(position.lastClaimTime) * 1000).toISOString()
+      };
+    });
+    return results.filter((item) => item && !item.error);
+  }
+
+  async getGasPrice() {
+    if (!this.provider) throw new Error('Provider is not configured');
+    const feeData = await this.provider.getFeeData();
+    return feeData.gasPrice === null ? null : Number(ethers.formatUnits(feeData.gasPrice, 'gwei'));
+  }
+
+  async getTokenBalances(userAddress, tokenAddresses) {
+    if (!this.provider) throw new Error('Provider is not configured');
+    const results = await this.readMany(tokenAddresses, async (address) => {
+      const token = new ethers.Contract(ethers.getAddress(address), ERC20_ABI, this.provider);
+      const [balance, decimals] = await Promise.all([token.balanceOf(userAddress), token.decimals()]);
+      return [address, asNumber(balance, decimals)];
+    });
+    return Object.fromEntries(results.filter((item) => Array.isArray(item)));
+  }
+
+  clearCache() {
+    this.priceCache.clear();
+    this.inflightPrices.clear();
+  }
+
+  setCacheTimeout(timeout) {
+    if (!Number.isFinite(timeout) || timeout < 0) throw new Error('Cache timeout must be a non-negative number');
+    this.cacheTimeout = timeout;
+  }
+}
+
+export default RealDataService;
